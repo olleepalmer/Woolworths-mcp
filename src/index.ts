@@ -31,7 +31,9 @@ type EndpointKey =
   | "browseCategory"
   | "categories"
   | "trolleyUpdate"
-  | "trolleyGet";
+  | "trolleyGet"
+  | "fulfilment"
+  | "deliveryInfo";
 
 interface DiscoveredEndpoint {
   url: string;
@@ -137,6 +139,30 @@ const DEFAULT_ENDPOINTS: Record<EndpointKey, EndpointConfig> = {
     discoveryPageUrl: "https://www.woolworths.com.au/shop/mylist",
     responseValidator: (d: unknown) => {
       return d != null && typeof d === "object";
+    },
+  },
+  fulfilment: {
+    url: "https://www.woolworths.com.au/apis/ui/Fulfilment",
+    method: "POST",
+    discoveryPatterns: ["ui/Fulfilment", "fulfilment"],
+    discoveryPageUrl: "https://www.woolworths.com.au/shop/checkout",
+    responseValidator: (d: unknown) => {
+      const obj = d as Record<string, unknown>;
+      return obj != null && typeof obj === "object" && "IsSuccessful" in obj;
+    },
+  },
+  deliveryInfo: {
+    url: "https://www.woolworths.com.au/apis/ui/Delivery/DeliveryInfo",
+    method: "GET",
+    discoveryPatterns: ["Delivery/DeliveryInfo", "delivery/deliveryinfo"],
+    discoveryPageUrl: "https://www.woolworths.com.au/shop/checkout",
+    responseValidator: (d: unknown) => {
+      const obj = d as Record<string, unknown>;
+      return (
+        obj != null &&
+        typeof obj === "object" &&
+        ("DeliveryMethod" in obj || "Address" in obj)
+      );
     },
   },
 };
@@ -827,6 +853,37 @@ const TOOLS: Tool[] = [
       required: ["stockcode", "quantity"],
     },
   },
+  {
+    name: "woolworths_get_delivery_info",
+    description:
+      "Get current delivery address, store, and fulfilment method",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "woolworths_set_fulfilment",
+    description:
+      "Set the delivery address and fulfilment method (delivery, pickup, or direct to boot)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        addressId: {
+          type: "number",
+          description: "Address ID (from delivery info or address list)",
+        },
+        fulfilmentMethod: {
+          type: "string",
+          description:
+            "Fulfilment method: Courier, Pickup, or DirectToBoot",
+          enum: ["Courier", "Pickup", "DirectToBoot"],
+          default: "Courier",
+        },
+      },
+      required: ["addressId"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1159,6 +1216,53 @@ async function handleUpdateCartQuantity(args: any): Promise<any> {
 }
 
 // ---------------------------------------------------------------------------
+// Tool Handlers — Fulfilment / Delivery
+// ---------------------------------------------------------------------------
+
+async function handleGetDeliveryInfo(_args: any): Promise<any> {
+  try {
+    const data = await resilientRequest("deliveryInfo", null, {});
+    const info = data as Record<string, unknown>;
+    return {
+      success: true,
+      deliveryMethod: info.DeliveryMethod,
+      address: info.Address,
+      currentDate: info.CurrentDateAtFulfilmentStore,
+      reservedDate: info.ReservedDate,
+      reservedTime: info.ReservedTime,
+      isExpress: info.IsExpress,
+      canLeaveUnattended: info.CanLeaveUnattended,
+      deliveryInstructions: info.DeliveryInstructions,
+    };
+  } catch (error: any) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function handleSetFulfilment(args: any): Promise<any> {
+  const addressId = args.addressId;
+  const fulfilmentMethod = args.fulfilmentMethod || "Courier";
+
+  try {
+    const data = await resilientRequest("fulfilment", null, {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        addressId,
+        fulfilmentMethod,
+      }),
+    });
+    const result = data as Record<string, unknown>;
+    return {
+      success: result.IsSuccessful === true,
+      message: result.Message || (result.IsSuccessful ? "Fulfilment updated" : "Failed to update"),
+      isNonServiced: result.IsNonServiced,
+    };
+  } catch (error: any) {
+    return { success: false, error: error.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main server setup
 // ---------------------------------------------------------------------------
 
@@ -1237,6 +1341,14 @@ async function main() {
 
         case "woolworths_update_cart_quantity":
           result = await handleUpdateCartQuantity(args || {});
+          break;
+
+        case "woolworths_get_delivery_info":
+          result = await handleGetDeliveryInfo(args || {});
+          break;
+
+        case "woolworths_set_fulfilment":
+          result = await handleSetFulfilment(args || {});
           break;
 
         default:
