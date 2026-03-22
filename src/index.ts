@@ -335,16 +335,21 @@ async function tryUrlMutations(
       const result = await rawFetch(mutatedUrl, options);
       const cls = classifyError(result, endpointKey);
       if (cls === "ok") {
+        // Validate response shape before caching — prevents caching wrong endpoints
+        const validator = DEFAULT_ENDPOINTS[endpointKey].responseValidator;
+        const defaultMethod = DEFAULT_ENDPOINTS[endpointKey].method;
+        if (!validator(result.data)) {
+          console.error(`[mutations] ${mutatedUrl} returned OK but failed response validation — skipping`);
+          continue;
+        }
         console.error(`[mutations] Hit: ${mutatedUrl}`);
-        // Cache this discovery so we don't mutate again next time
-        const method = options.method ?? resolveEndpoint(endpointKey).method;
         discoveryCache[endpointKey] = {
           url: mutatedUrl,
-          method,
+          method: defaultMethod,
           discoveredAt: new Date().toISOString(),
         };
         await saveDiscoveryCache();
-        return { url: mutatedUrl, method, data: result.data };
+        return { url: mutatedUrl, method: defaultMethod, data: result.data };
       }
     } catch {
       // mutation failed, try next
@@ -465,25 +470,52 @@ async function _doDiscover(
       return null;
     }
 
-    // Use the first captured match
-    const match = capturedRequests[0];
-    const discovered: DiscoveredEndpoint = {
-      url: match.url,
-      method: match.method,
-      discoveredAt: new Date().toISOString(),
-    };
+    // Validate captured matches against the response validator before accepting.
+    // Use the default method — discovery should not override POST→GET or vice versa,
+    // as captured request methods may come from unrelated page-rendering endpoints.
+    const defaultMethod = DEFAULT_ENDPOINTS[endpointKey].method;
+    const validator = config.responseValidator;
 
-    // Strip any query params from the discovered URL for the base endpoint
-    // but keep them if the original default also had query params
+    for (const match of capturedRequests) {
+      // Skip matches whose method conflicts with the default
+      if (match.method !== defaultMethod) {
+        console.error(
+          `[discovery] Skipping ${match.method} ${match.url} — expected ${defaultMethod}`
+        );
+        continue;
+      }
+
+      // Validate by actually fetching the endpoint and checking the response shape
+      try {
+        const testResult = await rawFetch(match.url, { method: defaultMethod });
+        if (testResult.status >= 200 && testResult.status < 300 && validator(testResult.data)) {
+          const discovered: DiscoveredEndpoint = {
+            url: match.url,
+            method: defaultMethod,
+            discoveredAt: new Date().toISOString(),
+          };
+          console.error(
+            `[discovery] Validated "${endpointKey}": ${discovered.method} ${discovered.url}`
+          );
+          discoveryCache[endpointKey] = discovered;
+          await saveDiscoveryCache();
+          return discovered;
+        } else {
+          console.error(
+            `[discovery] ${match.url} failed validation — response doesn't match expected shape`
+          );
+        }
+      } catch {
+        console.error(
+          `[discovery] ${match.url} failed fetch during validation`
+        );
+      }
+    }
+
     console.error(
-      `[discovery] Discovered "${endpointKey}": ${discovered.method} ${discovered.url}`
+      `[discovery] No captured requests passed validation for "${endpointKey}"`
     );
-
-    // Save to cache
-    discoveryCache[endpointKey] = discovered;
-    await saveDiscoveryCache();
-
-    return discovered;
+    return null;
   } catch (err: any) {
     console.error(`[discovery] Failed for "${endpointKey}": ${err.message}`);
     return null;
